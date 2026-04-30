@@ -1,5 +1,8 @@
 name: Upload Dev zip
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
