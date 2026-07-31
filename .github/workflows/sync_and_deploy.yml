@@ -1,0 +1,93 @@
+# PITS: keep this fork synced with upstream and the live API (cippdhguw) deployed.
+#
+# Why this exists: the frontend fork auto-syncs nightly via pull[bot] and redeploys the
+# SWA, but pull[bot] stopped syncing CIPP-API in Jan 2025. By 2026-07-30 the deployed API
+# (10.6.4) was 9 days / several releases behind the frontend (10.7.5), which broke the
+# Clients tab intermittently. This workflow keeps both halves in lockstep.
+#
+# Requires one repo secret: AZURE_FUNCTIONAPP_PUBLISH_PROFILE
+#   az functionapp deployment list-publishing-profiles -g rg-pits-cipp -n cippdhguw --xml \
+#     | gh secret set AZURE_FUNCTIONAPP_PUBLISH_PROFILE -R PacificITSupport/CIPP-API
+name: Sync upstream and deploy cippdhguw
+
+on:
+  schedule:
+    - cron: '30 2 * * *' # nightly, shortly after the frontend fork's ~02:12 UTC sync
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Deploy even if the sync brought no new commits'
+        type: boolean
+        default: false
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-deploy
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    if: github.repository == 'PacificITSupport/CIPP-API'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream (KelvinTegelaar:master)
+        id: sync
+        if: github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BEFORE=$(gh api repos/${{ github.repository }}/branches/master --jq '.commit.sha')
+          gh api -X POST repos/${{ github.repository }}/merge-upstream -f branch=master
+          AFTER=$(gh api repos/${{ github.repository }}/branches/master --jq '.commit.sha')
+          echo "before=$BEFORE after=$AFTER"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide whether to deploy
+        id: gate
+        env:
+          CHANGED: ${{ steps.sync.outputs.changed }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force_deploy }}
+        run: |
+          if [ "$EVENT" = "push" ] || [ "$CHANGED" = "true" ] || [ "$FORCE" = "true" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes; skipping deploy."
+          fi
+
+      - name: Checkout (post-merge master)
+        if: steps.gate.outputs.deploy == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Build modules
+        if: steps.gate.outputs.deploy == 'true'
+        shell: pwsh
+        run: ./Tools/Build-DevApiModules.ps1
+
+      - name: Create version.json and package
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          VERSION=$(tr -d '[:space:]' < version_latest.txt)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "{\"version\": \"${VERSION}\", \"commit\": \"${SHORT_SHA}\"}" > version.json
+          zip -r /tmp/cipp-api.zip . --exclude ".*" --exclude ".*/**"
+          echo "Packaged version ${VERSION} (${SHORT_SHA})"
+
+      - name: Deploy to Azure Function App cippdhguw
+        if: steps.gate.outputs.deploy == 'true'
+        uses: Azure/functions-action@v1
+        with:
+          app-name: cippdhguw
+          package: /tmp/cipp-api.zip
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
